@@ -1,5 +1,5 @@
 /**
- * fsb-rs Cloudflare Worker proxy.
+ * fsb-rs Cloudflare Worker proxy (v2).
  *
  * Sits in front of your fsb-rs server and streams every request through
  * Cloudflare's edge, so the origin IP stays hidden and clients get CF's
@@ -13,6 +13,9 @@
  *     downloads behave exactly like a direct connection.
  *   - Response bodies are streamed, never buffered: file size is irrelevant
  *     to worker memory.
+ *   - Origin redirects are followed at the edge, so a 3xx can never leak the
+ *     origin URL back to the client.
+ *   - Transient origin network errors are retried once for GET/HEAD.
  *
  * Configuration (wrangler.toml [vars] or the dashboard):
  *   ORIGIN            Required. Where fsb-rs actually runs, e.g.
@@ -71,18 +74,27 @@ export default {
       if (ip) headers.set("X-Forwarded-For", ip);
     }
 
-    const upstream = await fetch(target, {
+    const idempotent = request.method === "GET" || request.method === "HEAD";
+    const init = {
       method: request.method,
       headers,
       // GET/HEAD must not carry a body; everything else streams through.
-      body:
-        request.method === "GET" || request.method === "HEAD"
-          ? undefined
-          : request.body,
-      redirect: "manual",
+      body: idempotent ? undefined : request.body,
+      // Followed at the edge: the client never sees an upstream Location.
+      redirect: "follow",
       // Signed URLs and Range responses must never be served from a cache.
       cache: "no-store",
-    });
+    };
+
+    let upstream;
+    try {
+      upstream = await fetch(target, init);
+    } catch (err) {
+      // Connection resets and DNS blips from the origin: one clean retry for
+      // idempotent requests (headers only, nothing was streamed yet).
+      if (!idempotent) throw err;
+      upstream = await fetch(target, init);
+    }
 
     const responseHeaders = new Headers(upstream.headers);
     for (const name of ["connection", "keep-alive", "transfer-encoding"]) {
